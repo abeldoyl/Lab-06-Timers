@@ -1,7 +1,7 @@
     ; Abel Doyle
-    ; RCET3373
-    ; Lab5-1ISR
-    ; https://github.com/abeldoyl/Lab-05-ISRs/tree/main/Lab5-1ISR.X
+    ; RCET3375
+    ; Lab6-1ISR
+    ; https://github.com/abeldoyl/Lab-06-Timers/tree/main/Lab6-1Timers.X
     
 ; PIC16F883 Configuration Bit Settings
 
