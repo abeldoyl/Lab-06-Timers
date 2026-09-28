@@ -27,6 +27,8 @@
 #include <xc.inc>
   W_TEMP EQU 0x70
   STATUS_TEMP EQU 0x71
+ TMR1_PRELOAD_HI EQU 0xB1  ; 65536 - 20000 = 45536 = 0xB1E0 -> exact 20,000 Tcy period
+  TMR1_PRELOAD_LO EQU 0xE0
 ; Reset Vector at 0000h. Execution starts here after reset.
 PSECT resetVect,class=CODE,delta=2
 ResetVector: 
@@ -41,19 +43,26 @@ InterruptVector:
 PSECT code,class=CODE,delta=2
  
 Setup:
-    ; add device setup here
-    ; Bank 0
+   ; Bank 0
     BCF 0x03,6      ;Set Bank 0
     BCF 0x03,5      ;"
     CLRF PORTA      ;Clearing PORTA on reset
     CLRF PORTB      ;Clearing PORTB on reset
-    CLRF PORTC	    ;Clearing PORTC on reset
+    CLRF PORTC      ;Clearing PORTC on reset
+ 
+    CLRF T1CON      ;TMR1CS=0 (Fosc/4), prescale 1:1, TMR1ON=0 (off until preload is loaded)
+    MOVLW TMR1_PRELOAD_HI
+    MOVWF TMR1H     ;Load Timer1 preload, high byte
+    MOVLW TMR1_PRELOAD_LO
+    MOVWF TMR1L     ;Load Timer1 preload, low byte
+    BCF PIR1,0      ;Clear TMR1IF before enabling
  
     ; Bank 1
     BCF 0x03,6      ;Set Bank 1
     BSF 0x03,5      ;"
-    CLRF TRISA      ;Making PORTA an output
-    CLRF TRISC	    ;Making PORTC an output
+    CLRF TRISA      ;Making PORTA an output (RA0 = timer pulse, RA1 = main-loop toggle)
+    CLRF TRISC      ;Making PORTC an output
+    BSF PIE1,0      ;Enables the TMR1 interrupt bit (PIE1<TMR1IE>)
  
     ; Bank 3
     BSF 0x03,6      ;Set Bank 3
@@ -63,32 +72,43 @@ Setup:
  
     ;Interrupts
     BCF 0x03,6      ;Set Bank 1
-    BSF 0x03,5	    ;"
-    BCF OPTION_REG,6;Allows for interrupt on falling edge
-    BCF INTCON,1
-    BSF INTCON,4    ;Enables the INT external Interrupt bit
+    BSF 0x03,5      ;"
+    BSF INTCON,6    ;Enables peripheral interrupts (PEIE, required for TMR1)
     BSF INTCON,7    ;Enables global interrupts
-    
+ 
     BCF 0x03,6      ;Set Bank 0
     BCF 0x03,5      ;"
+    BSF T1CON,0     ;TMR1ON=1, starts Timer1 - period boundary begins here
     goto Main
-    
+ 
 Main:
     ; main code goes here
-    MOVLW 0x01      ;1 TCY
+    MOVLW 0x02      ;1 TCY   (bit 1 = RA1, main-loop diagnostic)
     XORWF PORTA,1   ;1 TCY
     goto Main
-    
+ 
 ISRHandler:
     MOVWF W_TEMP ;Copy W to TEMP register
     SWAPF STATUS,W ;Swap status to be saved into W
     ;Swaps are used because they do not affect the status bits
     MOVWF STATUS_TEMP ;Save status to bank zero STATUS_TEMP register
-    
-    INCF PORTC	    ;Increments PORTC on every interrupt
-    BCF INTCON,1    ;Clears the flag on RBo/INT
+    ;No bank-forcing needed here: Main never leaves Bank 0 (it only
+    ;touches PORTA), so the CPU is guaranteed to already be in Bank 0
+    ;when the interrupt is taken. TMR1H/TMR1L/PIR1/T1CON/PORTA are
+    ;all Bank 0 registers.
+ 
+    ;--- Step 1: service the timer ---
+    MOVLW TMR1_PRELOAD_HI
+    MOVWF TMR1H     ;Reload Timer1 high byte
+    MOVLW TMR1_PRELOAD_LO
+    MOVWF TMR1L     ;Reload Timer1 low byte
+    BCF PIR1,0      ;Clears TMR1IF
+ 
+    ;--- Steps 2/3: diagnostic pulse, adjacent instructions ---
+    BSF PORTA,0     ;Timer diagnostic pulse HIGH (RA0)
+    BCF PORTA,0     ;Timer diagnostic pulse LOW, immediately following
     goto LeaveISR
-    
+ 
 LeaveISR:
     SWAPF STATUS_TEMP,W ;Swap STATUS_TEMP register into W
     ;(sets bank to original state)
@@ -96,6 +116,5 @@ LeaveISR:
     SWAPF W_TEMP,F ;Swap W_TEMP
     SWAPF W_TEMP,W ;Swap W_TEMP into W
     RETFIE
-  
+ 
 End
-    
