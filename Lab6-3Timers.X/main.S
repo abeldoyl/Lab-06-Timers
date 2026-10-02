@@ -27,196 +27,178 @@
 #include <xc.inc>
   W_TEMP EQU 0x70
   STATUS_TEMP EQU 0x71
+  ; intersection_state: [7:4]=STATE_COUNT  [3]=TRANS  [2]=EW_DETECTED
+  ;                     [1]=NS_DETECTED    [0]=DIR
   intersection_state EQU 0x20
-  temp EQU 0x21   ; scratch
-  portb_prev EQU 0x22   ; last PORTB sample (for rising-edge detect)
-  portb_cur EQU 0x23
-  portb_rise EQU 0x24
-; Reset Vector at 0000h. Execution starts here after reset.
+  temp EQU 0x21           ; scratch
+
+  ; Timer1 reload: 65536 - 62500 = 3036 = 0x0BDC (0.5 s @ 4 MHz, 1:8)
+  T1_RELOAD_H EQU 0x0B
+  T1_RELOAD_L EQU 0xDC
+  COUNT_END_GREEN  EQU 0x0A   ; 5.0 s of green
+  COUNT_END_YELLOW EQU 0x02   ; 1.0 s of yellow (count restarts at 0 for yellow)
+
 PSECT resetVect,class=CODE,delta=2
-ResetVector: 
+ResetVector:
     goto Setup
 
-; Interrupt Vector at 0004h. Execution starts here after an interrupt.
 PSECT isrVect,class=CODE,delta=2
 InterruptVector:
     goto ISRHandler
 
-; Main code section starts at 0008h. User code goes here.
 PSECT code,class=CODE,delta=2
- 
+
 Setup:
-   ; Bank 0
-    BCF 0x03,6      ;Set Bank 0
-    BCF 0x03,5      ;"
-    CLRF PORTA      ;Clearing PORTA on reset
-    CLRF PORTB      ;Clearing PORTB on reset
-    CLRF PORTC      ;Clearing PORTC on reset
-    CLRF intersection_state
- 
-    ; Bank 1
-    BCF 0x03,6      ;Set Bank 1
-    BSF 0x03,5      ;"
-    CLRF TRISA      ;Making PORTA an output
-    CLRF TRISC      ;Making PORTC an output
-    MOVLW 0x07
-    MOVWF TRISB     ; RB0 = advance (INT), RB1 = N/S car, RB2 = E/W car
-    BSF OPTION_REG,6 ; INTEDG: rising edge on RB0
- 
-    ; Bank 3
-    BSF 0x03,6      ;Set Bank 3
-    BSF 0x03,5      ;"
-    CLRF ANSEL      ;Making PORTA digital I/O
-    CLRF ANSELH     ;Making PORTB digital I/O
- 
-    ;Interrupts
-    BCF 0x03,6      ;Set Bank 0 (INTCON is reachable from any bank)
+    ; Bank 0
+    BCF 0x03,6
     BCF 0x03,5
-    CLRF portb_cur      ; start from known values
-    CLRF portb_rise
-    MOVF PORTB,W        ; baseline sample of the pins
-    MOVWF portb_prev
-    BCF INTCON,1        ; clear stale INTF (after the read)
-    BCF INTCON,0        ; clear stale RBIF (after the read)
-    
-    BCF 0x03,6      ;Set Bank 1
-    BSF 0x03,5      ;"
-    BSF IOCB,1	    ;Enable interrupt-on-change for PORTB bit 1
-    BSF IOCB,2
-    BSF INTCON,3
-    BSF INTCON,4
-    BSF INTCON,7    ;Enables global interrupts
- 
-    BCF 0x03,6      ;Set Bank 0
-    BCF 0x03,5      ;"
+    CLRF PORTA
+    CLRF PORTB
+    CLRF PORTC
+    CLRF intersection_state
+
+    ; Bank 1
+    BCF 0x03,6
+    BSF 0x03,5
+    CLRF TRISA              ; PORTA = traffic-light outputs
+    CLRF TRISC              ; PORTC = state display
+    MOVLW 0x07
+    MOVWF TRISB             ; PORTB unused in Part 3 (left as inputs)
+
+    ; Bank 3
+    BSF 0x03,6
+    BSF 0x03,5
+    CLRF ANSEL
+    CLRF ANSELH
+
+    ; Timer1 setup (Bank 0)
+    BCF 0x03,6
+    BCF 0x03,5
+    MOVLW 0x30              ; 1:8 prescaler, internal clock, timer OFF
+    MOVWF T1CON
+    MOVLW T1_RELOAD_H
+    MOVWF TMR1H
+    MOVLW T1_RELOAD_L
+    MOVWF TMR1L
+    BCF PIR1,0              ; clear stale TMR1IF
+
+    ; Bank 1: enable Timer1 interrupt
+    BCF 0x03,6
+    BSF 0x03,5
+    BSF PIE1,0              ; TMR1IE
+
+    ; Bank 0
+    BCF 0x03,6
+    BCF 0x03,5
+    BSF INTCON,6            ; PEIE (needed for peripheral interrupts)
+    BSF T1CON,0             ; start Timer1
+    BSF INTCON,7            ; GIE
+
     goto Main
- 
+
 Main:
-    ; main code goes here
-    ;1) Display the packed state on every pass
+    ;1) Display the packed state on PORTC every pass
     MOVF intersection_state,W
     MOVWF PORTC
-    
-    ;2) Critical section: block ISRs while we read/modify the state byte
+
+    ;2) Decode DIRECTION and TRANSITION into PORTA every pass
+    BTFSC intersection_state,0
+    goto EW_Dir
+NS_Dir:
+    BTFSC intersection_state,3
+    goto NS_Yellow
+    MOVLW 0x0C              ; N/S green, E/W red
+    goto WritePortA
+NS_Yellow:
+    MOVLW 0x0A              ; N/S yellow, E/W red
+    goto WritePortA
+EW_Dir:
+    BTFSC intersection_state,3
+    goto EW_Yellow
+    MOVLW 0x21              ; N/S red, E/W green
+    goto WritePortA
+EW_Yellow:
+    MOVLW 0x11              ; N/S red, E/W yellow
+WritePortA:
+    MOVWF PORTA
+
+    ;3) Critical section: block ISR while reading/modifying the state byte
     BCF INTCON,7
-    BTFSC INTCON,7  ;confirm GIE really cleared
+    BTFSC INTCON,7          ; confirm GIE really cleared
     goto $-2
- 
-    ;extract STATE_COUNT into temp[3:0]
+
     SWAPF intersection_state,W
     ANDLW 0x0F
-    MOVWF temp
- 
-    MOVLW 0x03
+    MOVWF temp              ; temp = STATE_COUNT
+
+    MOVLW COUNT_END_GREEN
     XORWF temp,W
     BTFSC 0x03,2
-    goto Count3
- 
-    MOVLW 0x04
+    goto CountA
+
+    MOVLW COUNT_END_YELLOW
     XORWF temp,W
     BTFSC 0x03,2
-    goto Count4
- 
-    goto EvalDone		;counts 0,1,2 and 5-15: do nothing
-    
-Count3:
-    BTFSC intersection_state,3
+    goto CountC
+
+    goto EvalDone           ; all other counts: do nothing
+
+CountA:                     ; 5.0 s: green over, begin yellow
+    MOVLW 0x07              ; keep DIR, NS_DETECTED, EW_DETECTED
+    ANDWF intersection_state,F  ; clears STATE_COUNT and TRANS
+    BSF intersection_state,3    ; set TRANSITION
     goto EvalDone
-    BTFSC intersection_state,0
-    goto EW_Green
-    goto NS_Green
-    
-Count4:
+
+CountC:                     ; 6.0 s: finish an ACTIVE transition
     BTFSS intersection_state,3
-    goto EvalDone		;only finish an ACTIVE transition
+    goto EvalDone
     MOVLW 0x01
-    ANDWF intersection_state,W  ;W = DIR only (everything else cleared)
-    XORLW 0x01                  ;toggle Direction
+    ANDWF intersection_state,W  ; keep DIR only (clears count, TRANS, flags)
+    XORLW 0x01                  ; toggle direction
     MOVWF intersection_state
- 
+
 EvalDone:
     BSF INTCON,7
     goto Main
-    
-NS_Green:			;stay only if NS=1 and EW=0
-    BTFSS intersection_state,1
-    goto BeginTransition
-    BTFSC intersection_state,2
-    goto BeginTransition
-    goto SameDirection
- 
-EW_Green:			;stay only if EW=1 and NS=0
-    BTFSS intersection_state,2
-    goto BeginTransition
-    BTFSC intersection_state,1
-    goto BeginTransition
-    goto SameDirection
-    
-BeginTransition:
-    BSF intersection_state,3
-    goto EvalDone
- 
-SameDirection:              ; clear count, NS, EW; keep DIR (and TRANS, which is 0)
-    MOVLW 0x09              ; 0b00001001 = keep TRANS and DIR
-    ANDWF intersection_state,F
-    goto EvalDone
-    
-    
+
 ISRHandler:
-    MOVWF W_TEMP ;Copy W to TEMP register
-    SWAPF STATUS,W ;Swap status to be saved into W
-    ;Swaps are used because they do not affect the status bits
-    MOVWF STATUS_TEMP ;Save status to bank zero STATUS_TEMP register
-    
-    BCF 0x03,6            ; force Bank 0 (ISR can fire in any bank)
+    MOVWF W_TEMP
+    SWAPF STATUS,W
+    MOVWF STATUS_TEMP
+
+    BCF 0x03,6              ; force Bank 0
     BCF 0x03,5
- 
-    BTFSC INTCON,1          ; INTF set?
-    CALL INT_Service
-    BTFSC INTCON,0          ; RBIF set?
-    CALL IOC_Service
- 
+
+    BTFSC PIR1,0            ; TMR1IF set?
+    CALL Timer1_Service
+
 LeaveISR:
-    SWAPF STATUS_TEMP,W ;Swap STATUS_TEMP register into W
-    ;(sets bank to original state)
-    MOVWF STATUS ;Move W into STATUS register
-    SWAPF W_TEMP,F ;Swap W_TEMP
-    SWAPF W_TEMP,W ;Swap W_TEMP into W
+    SWAPF STATUS_TEMP,W
+    MOVWF STATUS
+    SWAPF W_TEMP,F
+    SWAPF W_TEMP,W
     RETFIE
-    
-; ----- External interrupt: increment STATE_COUNT only -----    
-INT_Service:
+
+; ----- Timer1 interrupt: reload, increment STATE_COUNT only -----
+Timer1_Service:
+    MOVLW T1_RELOAD_H       ; reload for the next 0.5 s period
+    MOVWF TMR1H
+    MOVLW T1_RELOAD_L
+    MOVWF TMR1L
+
     MOVF intersection_state,W
-    ANDLW 0xF0              ; (1) extract count, flags masked off
+    ANDLW 0xF0              ; extract count, flags masked off
     MOVWF temp
-    SWAPF temp,F            ; (2) position count into bits 3:0
-    INCF temp,F             ; (3) increment
+    SWAPF temp,F            ; count into bits 3:0
+    INCF temp,F
     MOVLW 0x0F
-    ANDWF temp,F            ;     wrap 15->0, nothing spills upward
-    SWAPF temp,F            ; (4) back into bits 7:4, low nibble = 0
+    ANDWF temp,F            ; wrap 15->0
+    SWAPF temp,F            ; back to bits 7:4
     MOVLW 0x0F
-    ANDWF intersection_state,F  ; (5) keep flags, zero old count
+    ANDWF intersection_state,F  ; keep flags, zero old count
     MOVF temp,W
-    IORWF intersection_state,F  ;     merge new count with preserved flags
-    BCF INTCON,1            ; clear INTF
+    IORWF intersection_state,F  ; merge new count with preserved flags
+    BCF PIR1,0              ; clear TMR1IF
     RETURN
- 
-; ----- PORTB IOC: latch low-to-high events on RB1 / RB2 -----
-IOC_Service:
-    MOVF PORTB,W            ; reading PORTB ends the mismatch condition
-    MOVWF portb_cur
-    XORWF portb_prev,W      ; W = bits that changed
-    ANDWF portb_cur,W       ; W = changed AND now high = rising edges
-    MOVWF portb_rise
-    MOVF portb_cur,W
-    MOVWF portb_prev        ; save sample for next time
- 
-    BTFSC portb_rise,1      ; RB1 rose -> N/S car
-    BSF intersection_state,1
-    BTFSC portb_rise,2      ; RB2 rose -> E/W car
-    BSF intersection_state,2
- 
-    BCF INTCON,0            ; clear RBIF (after the PORTB read)
-    RETURN
- 
+
 End
